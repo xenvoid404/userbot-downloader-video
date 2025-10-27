@@ -1,0 +1,14 @@
+[Unit]
+Description=Pyrogram Userbot Downloader
+After=network.target
+
+[Service]
+User=root 
+Group=root
+WorkingDirectory=/opt/userbot-downloader-video
+ExecStart=/opt/userbot-downloader-video/venv/bin/python3 /opt/userbot-downloader-video/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

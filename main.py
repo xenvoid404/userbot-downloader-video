@@ -1,6 +1,7 @@
 from pyrogram import Client, filters
 import os
 import logging
+import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,7 +14,45 @@ logging.getLogger("pyrogram").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 
-# --- Kredensial & Setup ---
+def humanbytes(size):
+    """Mengubah byte menjadi format yang mudah dibaca"""
+    if not size:
+        return "0 B"
+    power = 2**10
+    n = 0
+    powers_dict = {0: "B", 1: "KB", 2: "MB", 3: "GB", 4: "TB"}
+    while size > power:
+        size /= power
+        n += 1
+    return f"{size:.2f} {powers_dict[n]}"
+
+
+def create_progress_callback(filename):
+    """
+    Membuat fungsi progress callback yang stateful dan unik
+    untuk setiap download.
+    """
+    last_log_time = time.time()
+    LOG_INTERVAL = 30
+
+    async def progress_callback(current, total):
+        nonlocal last_log_time
+        now = time.time()
+
+        if (now - last_log_time > LOG_INTERVAL) or (current == total):
+            percentage = (current / total) * 100
+            current_size = humanbytes(current)
+            total_size = humanbytes(total)
+
+            log.info(
+                f"Downloading {filename}: {current_size} / {total_size} ({percentage:.1f}%)"
+            )
+
+            last_log_time = now
+
+    return progress_callback
+
+
 API_ID = 0
 API_HASH = "what?"
 SESSION = "userbot_session"
@@ -58,11 +97,18 @@ async def download_replied_video(client, message):
 
     save_path = os.path.join(DOWNLOAD_DIR, filename)
 
-    log.info(f"Mulai download: {filename}")
+    progress_for_this_file = create_progress_callback(filename)
+
+    log.info(f"Mulai download: {filename} (Total: {humanbytes(media.file_size)})")
 
     try:
-        await client.download_media(replied, file_name=save_path)
-        log.info(f"Video tersimpan: {save_path}")
+        await client.download_media(
+            replied,
+            file_name=save_path,
+            progress=progress_for_this_file,
+        )
+
+        log.info(f"Video tersimpan: {save_path} (Download 100% selesai)")
 
     except Exception as e:
         log.exception(f"Gagal download file {filename}.")
