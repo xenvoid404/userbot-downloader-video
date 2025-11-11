@@ -1,0 +1,841 @@
+from telethon import TelegramClient, events
+from telethon.tl.types import DocumentAttributeVideo
+import os
+import logging
+import time
+import asyncio
+import json
+from pathlib import Path
+from typing import Optional, Tuple, Callable
+from dataclasses import dataclass
+from enum import Enum
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+
+@dataclass
+class Config:
+    """Centralized configuration"""
+
+    API_ID: int = 25329914
+    API_HASH: str = "319773b99dd80f1a76de582aa0d478e4"
+    SESSION: str = "userbot_session"
+    DOWNLOAD_DIR: str = "videos"
+    GUDANG_CHAT_ID: int = -1003129578562
+
+    # FFmpeg settings
+    FFMPEG_TIMEOUT: int = 120
+    THUMBNAIL_TIME: str = "00:00:05"
+    THUMBNAIL_QUALITY: int = 3
+
+    # Download settings
+    DOWNLOAD_TIMEOUT: int = 3600
+    PROGRESS_UPDATE_INTERVAL: float = 15.0
+
+    # Supported video extensions
+    VIDEO_EXTENSIONS: tuple = (".mp4", ".mov", ".avi", ".mkv", ".flv", ".webm")
+
+    def __post_init__(self):
+        """Validate and create directories"""
+        self.download_path = Path(self.DOWNLOAD_DIR)
+        self.download_path.mkdir(exist_ok=True)
+
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+
+class ColoredFormatter(logging.Formatter):
+    """Custom formatter with colors and better structure"""
+
+    COLORS = {
+        "DEBUG": "\033[36m",  # Cyan
+        "INFO": "\033[32m",  # Green
+        "WARNING": "\033[33m",  # Yellow
+        "ERROR": "\033[31m",  # Red
+        "CRITICAL": "\033[35m",  # Magenta
+    }
+    RESET = "\033[0m"
+
+    def format(self, record):
+        log_color = self.COLORS.get(record.levelname, self.RESET)
+        record.levelname = f"{log_color}{record.levelname:8}{self.RESET}"
+        return super().format(record)
+
+
+def setup_logging() -> logging.Logger:
+    """Setup logging with custom formatter"""
+    logger = logging.getLogger("userbot")
+    logger.setLevel(logging.INFO)
+
+    handler = logging.StreamHandler()
+    formatter = ColoredFormatter(
+        fmt="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S"
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    # Suppress telethon noise
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+
+    return logger
+
+
+log = setup_logging()
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+
+class TaskType(Enum):
+    """Task types enumeration"""
+
+    DOWNLOAD = "download"
+    UPLOAD = "upload"
+
+
+def humanbytes(size: int) -> str:
+    """Convert bytes to human readable format"""
+    if not size:
+        return "0 B"
+
+    units = ["B", "KB", "MB", "GB", "TB"]
+    power = 1024
+    n = 0
+
+    while size >= power and n < len(units) - 1:
+        size /= power
+        n += 1
+
+    return f"{size:.2f} {units[n]}"
+
+
+def create_progress_callback(filename: str, action: str = "Processing") -> Callable:
+    """Factory for progress callback with throttling"""
+    last_update = {"time": time.time()}
+
+    def callback(current: int, total: int) -> None:
+        now = time.time()
+        if (now - last_update["time"] >= Config.PROGRESS_UPDATE_INTERVAL) or (
+            current == total
+        ):
+            pct = (current / total) * 100 if total > 0 else 0
+            log.info(
+                f"{action:12} | {filename:30} | "
+                f"{humanbytes(current):>10}/{humanbytes(total):<10} ({pct:5.1f}%)"
+            )
+            last_update["time"] = now
+
+    return callback
+
+
+# ============================================================================
+# FFMPEG OPERATIONS
+# ============================================================================
+
+
+class FFmpegError(Exception):
+    """Custom exception for FFmpeg operations"""
+
+    pass
+
+
+class FFmpegHelper:
+    """Helper class for FFmpeg operations"""
+
+    @staticmethod
+    async def run_command(
+        command: list, description: str, timeout: int = Config.FFMPEG_TIMEOUT
+    ) -> Optional[bytes]:
+        """Run FFmpeg/ffprobe command with proper error handling"""
+        try:
+            log.debug(f"Running: {' '.join(command)}")
+
+            proc = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise FFmpegError(f"{description} timeout (>{timeout}s)")
+
+            if proc.returncode != 0:
+                error_msg = stderr.decode("utf-8", errors="ignore")[:500]
+                raise FFmpegError(f"{description} failed: {error_msg}")
+
+            log.debug(f"{description} completed successfully")
+            return stdout
+
+        except FileNotFoundError:
+            raise FFmpegError("FFmpeg/ffprobe not found. Please install FFmpeg!")
+        except Exception as e:
+            raise FFmpegError(f"{description} error: {str(e)}")
+
+    @staticmethod
+    async def generate_thumbnail(video_path: Path) -> Optional[Path]:
+        """Generate video thumbnail"""
+        thumb_path = video_path.with_suffix(".jpg")
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-ss",
+            Config.THUMBNAIL_TIME,
+            "-vframes",
+            "1",
+            "-q:v",
+            str(Config.THUMBNAIL_QUALITY),
+            str(thumb_path),
+        ]
+
+        try:
+            await FFmpegHelper.run_command(
+                command, f"Generate thumbnail for {video_path.name}"
+            )
+
+            if thumb_path.exists():
+                log.info(
+                    f"Thumbnail   | {thumb_path.name} | Size: {humanbytes(thumb_path.stat().st_size)}"
+                )
+                return thumb_path
+        except FFmpegError as e:
+            log.warning(f"Thumbnail generation failed: {e}")
+
+        return None
+
+    @staticmethod
+    async def get_video_metadata(
+        file_path: Path,
+    ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+        """Extract video metadata (width, height, duration)"""
+        command = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_streams",
+            str(file_path),
+        ]
+
+        try:
+            result = await FFmpegHelper.run_command(
+                command, f"Extract metadata from {file_path.name}"
+            )
+
+            if not result:
+                return None, None, None
+
+            data = json.loads(result.decode("utf-8"))
+            video_stream = next(
+                (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+                None,
+            )
+
+            if not video_stream:
+                log.warning("No video stream found in file")
+                return None, None, None
+
+            width = int(video_stream.get("width", 0))
+            height = int(video_stream.get("height", 0))
+            duration = int(float(video_stream.get("duration", 0)) + 0.5)
+
+            log.info(
+                f"Metadata    | Resolution: {width}x{height} | Duration: {duration}s"
+            )
+            return width, height, duration
+
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            log.error(f"Failed to parse metadata: {e}")
+            return None, None, None
+        except FFmpegError as e:
+            log.error(f"Metadata extraction failed: {e}")
+            return None, None, None
+
+    @staticmethod
+    async def optimize_for_streaming(input_path: Path) -> Path:
+        """Optimize video for streaming with faststart flag"""
+        output_path = input_path.with_stem(f"{input_path.stem}_stream")
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            str(output_path),
+        ]
+
+        try:
+            await FFmpegHelper.run_command(
+                command, f"Optimize {input_path.name} for streaming", timeout=180
+            )
+
+            if output_path.exists():
+                original_size = input_path.stat().st_size
+                optimized_size = output_path.stat().st_size
+
+                log.info(
+                    f"Optimized   | {output_path.name} | "
+                    f"Original: {humanbytes(original_size)} → "
+                    f"Optimized: {humanbytes(optimized_size)}"
+                )
+                return output_path
+        except FFmpegError as e:
+            log.warning(f"Optimization failed: {e}, using original file")
+
+        return input_path
+
+    @staticmethod
+    async def check_if_video(file_path: Path) -> bool:
+        """Check if file is a video using ffprobe"""
+        command = [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            str(file_path),
+        ]
+
+        try:
+            result = await FFmpegHelper.run_command(
+                command, f"Check format of {file_path.name}"
+            )
+
+            if not result:
+                return False
+
+            data = json.loads(result.decode("utf-8"))
+            format_name = data.get("format", {}).get("format_name", "").lower()
+
+            video_formats = ["mp4", "mov", "avi", "matroska", "webm", "flv"]
+            return any(fmt in format_name for fmt in video_formats)
+
+        except Exception as e:
+            log.debug(f"Format check failed: {e}")
+            return False
+
+
+# ============================================================================
+# FILE OPERATIONS
+# ============================================================================
+
+
+class FileManager:
+    """Manages file operations"""
+
+    @staticmethod
+    async def cleanup_file(file_path: Path) -> bool:
+        """Safely remove file asynchronously"""
+        try:
+            if file_path.exists():
+                await asyncio.get_event_loop().run_in_executor(None, file_path.unlink)
+                log.debug(f"Cleaned up: {file_path.name}")
+                return True
+        except Exception as e:
+            log.warning(f"Cleanup failed for {file_path.name}: {e}")
+        return False
+
+    @staticmethod
+    async def cleanup_files(*file_paths: Path) -> None:
+        """Cleanup multiple files"""
+        tasks = [FileManager.cleanup_file(fp) for fp in file_paths if fp]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ============================================================================
+# TASK MANAGEMENT
+# ============================================================================
+
+
+@dataclass
+class Task:
+    """Task tracking data structure"""
+
+    task_id: int
+    task_type: TaskType
+    filename: str
+    task_obj: asyncio.Task
+
+
+class TaskManager:
+    """Manages active tasks"""
+
+    def __init__(self):
+        self._tasks: dict[int, Task] = {}
+        self._counter: int = 0
+        self._lock = asyncio.Lock()
+
+    async def reserve_next_task_id(self) -> int:
+        """Mencadangkan dan mengembalikan ID tugas berikutnya."""
+        async with self._lock:
+            self._counter += 1
+            return self._counter
+
+    async def register_task(
+        self, task_id: int, task_type: TaskType, filename: str, coro
+    ) -> asyncio.Task:
+        """Membuat dan mendaftarkan tugas dengan ID yang sudah dicadangkan."""
+        async with self._lock:
+            task_obj = asyncio.create_task(coro)
+            self._tasks[task_id] = Task(task_id, task_type, filename, task_obj)
+            log.info(
+                f"Task {task_id:3} | {task_type.value.upper():8} | Started: {filename}"
+            )
+            return task_obj
+
+    async def remove_task(self, task_id: int) -> None:
+        """Remove task from tracking"""
+        async with self._lock:
+            if task_id in self._tasks:
+                task = self._tasks.pop(task_id)
+                log.info(
+                    f"Task {task_id:3} | {task.task_type.value.upper():8} | "
+                    f"Completed: {task.filename} | Active: {len(self._tasks)}"
+                )
+
+    def get_tasks_by_type(self, task_type: TaskType) -> list[Task]:
+        """Get all tasks of specific type"""
+        return [t for t in self._tasks.values() if t.task_type == task_type]
+
+    def get_task_count(self) -> int:
+        """Get active task count"""
+        return len(self._tasks)
+
+    def get_all_tasks(self) -> list[Task]:
+        """Get all active tasks"""
+        return list(self._tasks.values())
+
+
+# ============================================================================
+# WORKERS
+# ============================================================================
+
+
+class Workers:
+    """Worker functions for download and upload operations"""
+
+    @staticmethod
+    async def download_worker(
+        client: TelegramClient,
+        event,
+        message,
+        filename: str,
+        task_id: int,
+        task_manager: TaskManager,
+        config: Config,
+    ) -> None:
+        """Download worker with comprehensive error handling"""
+        save_path = config.download_path / filename
+
+        try:
+            file_size = message.file.size if message.file else 0
+            log.info(
+                f"Task {task_id:3} | DOWNLOAD | "
+                f"File: {filename} | Size: {humanbytes(file_size)}"
+            )
+
+            # Download with timeout protection
+            download_task = client.download_media(
+                message,
+                file=str(save_path),
+                progress_callback=create_progress_callback(filename, "Downloading"),
+            )
+
+            await asyncio.wait_for(download_task, timeout=config.DOWNLOAD_TIMEOUT)
+
+            log.info(f"Task {task_id:3} | DOWNLOAD | Success: {filename}")
+
+            await event.respond(
+                f"✅ **Download Complete** [`{task_id}`]\n"
+                f"📄 File: `{filename}`\n"
+                f"💾 Size: `{humanbytes(file_size)}`\n\n"
+                f"Upload: `/upload {filename} [caption]`"
+            )
+
+        except asyncio.TimeoutError:
+            log.error(f"Task {task_id:3} | DOWNLOAD | Timeout: {filename}")
+            await event.respond(f"❌ **Timeout** [`{task_id}`]: `{filename}`")
+        except Exception as e:
+            log.exception(f"Task {task_id:3} | DOWNLOAD | Error: {filename}")
+            await event.respond(
+                f"❌ **Download Failed** [`{task_id}`]\nError: `{str(e)[:200]}`"
+            )
+        finally:
+            await task_manager.remove_task(task_id)
+
+    @staticmethod
+    async def upload_worker(
+        client: TelegramClient,
+        event,
+        filename: str,
+        caption: Optional[str],
+        task_id: int,
+        task_manager: TaskManager,
+        config: Config,
+    ) -> None:
+        """Upload worker with video optimization"""
+        file_path = config.download_path / filename
+        thumb_path: Optional[Path] = None
+        optimized_path: Optional[Path] = None
+        upload_path = file_path
+
+        try:
+            log.info(
+                f"Task {task_id:3} | UPLOAD   | "
+                f"File: {filename} | Caption: {caption or 'None'}"
+            )
+
+            # Check if video and optimize
+            is_video_ext = file_path.suffix.lower() in config.VIDEO_EXTENSIONS
+
+            if is_video_ext:
+                is_video = await FFmpegHelper.check_if_video(file_path)
+
+                if is_video:
+                    log.info(
+                        f"Task {task_id:3} | UPLOAD   | Optimizing video for streaming..."
+                    )
+                    optimized_path = await FFmpegHelper.optimize_for_streaming(
+                        file_path
+                    )
+                    upload_path = optimized_path
+
+            # Extract metadata
+            width, height, duration = await FFmpegHelper.get_video_metadata(upload_path)
+
+            if not all([width, height, duration]):
+                raise ValueError("Failed to extract video metadata")
+
+            # Generate thumbnail
+            thumb_path = await FFmpegHelper.generate_thumbnail(upload_path)
+
+            # Prepare video attributes
+            attributes = [
+                DocumentAttributeVideo(
+                    duration=duration, w=width, h=height, supports_streaming=True
+                )
+            ]
+
+            # Upload
+            log.info(
+                f"Task {task_id:3} | UPLOAD   | Uploading to {config.GUDANG_CHAT_ID}..."
+            )
+
+            await client.send_file(
+                config.GUDANG_CHAT_ID,
+                str(upload_path),
+                caption=caption,
+                thumb=str(thumb_path) if thumb_path else None,
+                attributes=attributes,
+                progress_callback=create_progress_callback(filename, "Uploading"),
+            )
+
+            log.info(f"Task {task_id:3} | UPLOAD   | Success: {filename}")
+
+            await event.respond(
+                f"✅ **Upload Complete** [`{task_id}`]\n"
+                f"📄 File: `{filename}`\n"
+                f"📺 Resolution: `{width}x{height}`\n"
+                f"⏱️ Duration: `{duration}s`\n"
+                f"🎬 Streaming: `Enabled`"
+            )
+
+        except Exception as e:
+            log.exception(f"Task {task_id:3} | UPLOAD   | Error: {filename}")
+            await event.respond(
+                f"❌ **Upload Failed** [`{task_id}`]\nError: `{str(e)[:200]}`"
+            )
+        finally:
+            # Cleanup
+            await FileManager.cleanup_files(
+                thumb_path,
+                optimized_path if optimized_path != file_path else None,
+                file_path,
+            )
+            await task_manager.remove_task(task_id)
+
+
+# ============================================================================
+# BOT CLASS
+# ============================================================================
+
+
+class TelegramUserbot:
+    """Main userbot class"""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.client = TelegramClient(config.SESSION, config.API_ID, config.API_HASH)
+        self.task_manager = TaskManager()
+        self._setup_handlers()
+
+    def _setup_handlers(self):
+        """Setup event handlers"""
+        self.client.on(events.NewMessage(outgoing=True, pattern=r"^/upload"))(
+            self.handle_upload
+        )
+        self.client.on(events.NewMessage(outgoing=True, pattern=r"^/download"))(
+            self.handle_download
+        )
+        self.client.on(events.NewMessage(outgoing=True, pattern=r"^/status"))(
+            self.handle_status
+        )
+        self.client.on(events.NewMessage(outgoing=True, pattern=r"^/id"))(
+            self.handle_id
+        )
+        self.client.on(events.NewMessage(outgoing=True, pattern=r"^/logs"))(
+            self.handle_logs
+        )
+        self.client.on(events.NewMessage(outgoing=True, pattern=r"^/help"))(
+            self.handle_help
+        )
+
+    async def handle_upload(self, event):
+        """Handle /upload command"""
+        if self.config.GUDANG_CHAT_ID == -100123456789:
+            await event.edit("❌ Please set `GUDANG_CHAT_ID` in config!")
+            return
+
+        # Parse command
+        parts = event.message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await event.edit(
+                "❌ **Usage:**\n"
+                "`/upload [filename] [caption]`\n\n"
+                "**Example:**\n"
+                "`/upload video.mp4`\n"
+                "`/upload video.mp4 My awesome video`"
+            )
+            return
+
+        args = parts[1].split(maxsplit=1)
+        filename = args[0]
+        caption = args[1] if len(args) > 1 else None
+
+        file_path = self.config.download_path / filename
+        if not file_path.exists():
+            await event.edit(f"❌ File not found: `{filename}`")
+            return
+
+        # 1. Pesan ID dulu
+        task_id = await self.task_manager.reserve_next_task_id()
+
+        # 2. Buat coroutine dengan ID yang benar
+        coro = Workers.upload_worker(
+            self.client,
+            event,
+            filename,
+            caption,
+            task_id,  # <-- ID yang benar
+            self.task_manager,
+            self.config,
+        )
+
+        # 3. Daftarkan task (sekaligus menjalankannya)
+        await self.task_manager.register_task(task_id, TaskType.UPLOAD, filename, coro)
+
+        await event.edit(
+            f"🚀 **Upload Started** [`{task_id}`]\n"
+            f"📄 File: `{filename}`\n"
+            f"📊 Active tasks: `{self.task_manager.get_task_count()}`"
+        )
+
+    async def handle_download(self, event):
+        """Handle /download command"""
+        replied = await event.get_reply_message()
+        if not replied or not replied.file:
+            await event.edit("❌ Reply to a video/document file!")
+            return
+
+        # Parse command
+        parts = event.message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await event.edit(
+                "❌ **Usage:**\n"
+                "`/download [filename]`\n\n"
+                "**Example:**\n"
+                "`/download myvideo.mp4`"
+            )
+            return
+
+        filename_base = parts[1].strip()
+
+        # Auto extension
+        ext = ".mp4"
+        if replied.file.name and "." in replied.file.name:
+            ext = "." + replied.file.name.rsplit(".", 1)[-1]
+        elif replied.file.mime_type:
+            ext = "." + replied.file.mime_type.split("/")[-1]
+
+        filename = (
+            filename_base if filename_base.endswith(ext) else f"{filename_base}{ext}"
+        )
+
+        # 1. Pesan ID dulu
+        task_id = await self.task_manager.reserve_next_task_id()
+
+        # 2. Buat coroutine dengan ID yang benar
+        coro = Workers.download_worker(
+            self.client,
+            event,
+            replied,
+            filename,
+            task_id,  # <-- ID yang benar
+            self.task_manager,
+            self.config,
+        )
+
+        # 3. Daftarkan task
+        await self.task_manager.register_task(
+            task_id, TaskType.DOWNLOAD, filename, coro
+        )
+
+        await event.edit(
+            f"🚀 **Download Started** [`{task_id}`]\n"
+            f"📄 File: `{filename}`\n"
+            f"💾 Size: `{humanbytes(replied.file.size)}`\n"
+            f"📊 Active tasks: `{self.task_manager.get_task_count()}`"
+        )
+
+    async def handle_status(self, event):
+        """Handle /status command"""
+        tasks = self.task_manager.get_all_tasks()
+
+        if not tasks:
+            await event.edit("✅ No active tasks")
+            return
+
+        downloads = self.task_manager.get_tasks_by_type(TaskType.DOWNLOAD)
+        uploads = self.task_manager.get_tasks_by_type(TaskType.UPLOAD)
+
+        text = f"📊 **Active Tasks:** `{len(tasks)}`\n\n"
+
+        if downloads:
+            text += f"⏬ **Downloads ({len(downloads)}):**\n"
+            for task in downloads:
+                text += f"  • [`{task.task_id}`] `{task.filename}`\n"
+            text += "\n"
+
+        if uploads:
+            text += f"📤 **Uploads ({len(uploads)}):**\n"
+            for task in uploads:
+                text += f"  • [`{task.task_id}`] `{task.filename}`\n"
+
+        await event.edit(text)
+
+    async def handle_id(self, event):
+        """Handle /id command"""
+        chat_id = event.chat_id
+        await event.edit(
+            f"🆔 **Chat Information**\n\n"
+            f"**ID:** `{chat_id}`\n"
+            f"**Type:** `{'User' if chat_id > 0 else 'Group/Channel'}`"
+        )
+
+    async def handle_logs(self, event):
+        """Handle /logs command"""
+        logger = logging.getLogger("userbot")
+        current_level = logger.level
+
+        if current_level == logging.INFO:
+            logger.setLevel(logging.DEBUG)
+            await event.edit("🔍 **Debug logging enabled**")
+        else:
+            logger.setLevel(logging.INFO)
+            await event.edit("🔍 **Debug logging disabled**")
+
+    async def handle_help(self, event):
+        """Handle /help command"""
+        help_text = """
+🤖 **Telegram Userbot Commands**
+
+**📥 Download:**
+`/download [filename]` - Download replied video/file
+Example: `/download myvideo.mp4`
+
+**📤 Upload:**
+`/upload [filename] [caption]` - Upload video with streaming optimization
+Example: `/upload video.mp4 My Video Title`
+
+**📊 Status:**
+`/status` - Check active download/upload tasks
+
+**🆔 Utilities:**
+`/id` - Get current chat ID
+`/logs` - Toggle debug logging
+`/help` - Show this help message
+
+**Features:**
+✅ Async operations
+✅ Streaming optimization
+✅ Thumbnail generation
+✅ Progress tracking
+✅ Error recovery
+"""
+        await event.edit(help_text)
+
+    async def start(self):
+        """Start the userbot"""
+        log.info("=" * 60)
+        log.info("🚀 TELEGRAM USERBOT STARTING")
+        log.info("=" * 60)
+
+        await self.client.start()
+
+        me = await self.client.get_me()
+        log.info(f"✅ Connected successfully!")
+        log.info(f"👤 User: {me.first_name} (@{me.username or 'no username'})")
+        log.info(f"📱 Phone: {me.phone or 'N/A'}")
+        log.info(f"📁 Download dir: {self.config.download_path.absolute()}")
+        log.info(f"📤 Upload target: {self.config.GUDANG_CHAT_ID}")
+        log.info("=" * 60)
+        log.info("💡 Bot ready! Type /help for commands")
+        log.info("=" * 60)
+
+        await self.client.run_until_disconnected()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+
+async def main():
+    """Main entry point"""
+    config = Config()
+    bot = TelegramUserbot(config)
+
+    try:
+        await bot.start()
+    except KeyboardInterrupt:
+        log.info("👋 Shutting down gracefully...")
+    except Exception as e:
+        log.exception(f"Fatal error: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
