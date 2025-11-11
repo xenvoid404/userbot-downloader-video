@@ -1,17 +1,20 @@
 import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
-from telethon import TelegramClient, events
+
+from telethon import TelegramClient
 from telethon.tl.types import DocumentAttributeVideo
+
 from src.config import Config
-from src.utils import create_progress_callback, humanbytes
-from src.ffmpeg_helper import FFmpegHelper
+from src.utils import TaskType, create_progress_callback, humanbytes
+from src.task_manager import TaskManager
+from src.ffmpeg_helper import FFmpegHelper, FFmpegError
 from src.file_manager import FileManager
-from src.task_manager import TaskManager, TaskType
 
 
 class Workers:
-    """Worker functions for download and upload operations"""
+    """Background workers for file operations"""
 
     @staticmethod
     async def download_worker(
@@ -22,35 +25,48 @@ class Workers:
         task_id: int,
         task_manager: TaskManager,
         config: Config,
+        logger: logging.Logger,
     ) -> None:
-        """Download worker with semaphore control"""
-        from .logging_config import setup_logging
+        """
+        Download file from Telegram with timeout and error handling
 
-        log = setup_logging()
-
+        Args:
+            client: Telegram client
+            event: Triggering event
+            message: Message containing file to download
+            filename: Target filename
+            task_id: Unique task identifier
+            task_manager: Task manager instance
+            config: Application config
+            logger: Logger instance
+        """
         save_path = config.download_path / filename
+        file_manager = FileManager(logger)
 
-        # Acquire semaphore sebelum mulai download
-        async with task_manager.download_semaphore:
+        async with task_manager.get_semaphore(TaskType.DOWNLOAD):
             try:
                 file_size = message.file.size if message.file else 0
-                log.info(
+                logger.info(
                     f"Task {task_id:3} | DOWNLOAD | "
-                    f"File: {filename} | Size: {humanbytes(file_size)}"
+                    f"{filename} ({humanbytes(file_size)})"
                 )
 
-                # Download with timeout protection
-                download_task = client.download_media(
-                    message,
-                    file=str(save_path),
-                    progress_callback=create_progress_callback(
-                        filename, "Downloading", config.PROGRESS_UPDATE_INTERVAL
+                # Download with progress and timeout
+                await asyncio.wait_for(
+                    client.download_media(
+                        message,
+                        file=str(save_path),
+                        progress_callback=create_progress_callback(
+                            filename,
+                            "Downloading",
+                            config.PROGRESS_UPDATE_INTERVAL,
+                            logger,
+                        ),
                     ),
+                    timeout=config.DOWNLOAD_TIMEOUT,
                 )
 
-                await asyncio.wait_for(download_task, timeout=config.DOWNLOAD_TIMEOUT)
-
-                log.info(f"Task {task_id:3} | DOWNLOAD | Success: {filename}")
+                logger.info(f"Task {task_id:3} | DOWNLOAD | Success: {filename}")
 
                 await event.respond(
                     f"✅ **Download Complete** [`{task_id}`]\n"
@@ -60,21 +76,19 @@ class Workers:
                 )
 
             except asyncio.TimeoutError:
-                from .utils import humanbytes
+                logger.error(f"Task {task_id:3} | DOWNLOAD | Timeout: {filename}")
+                await event.respond(
+                    f"❌ **Download Timeout** [`{task_id}`]\n`{filename}`"
+                )
+                await file_manager.cleanup_file(save_path)
 
-                log.error(f"Task {task_id:3} | DOWNLOAD | Timeout: {filename}")
-                await event.respond(f"❌ **Timeout** [`{task_id}`]: `{filename}`")
-                # Cleanup on failure
-                await FileManager.cleanup_file(save_path)
             except Exception as e:
-                from .utils import humanbytes
-
-                log.exception(f"Task {task_id:3} | DOWNLOAD | Error: {filename}")
+                logger.exception(f"Task {task_id:3} | DOWNLOAD | Error: {filename}")
                 await event.respond(
                     f"❌ **Download Failed** [`{task_id}`]\nError: `{str(e)[:200]}`"
                 )
-                # Cleanup on failure
-                await FileManager.cleanup_file(save_path)
+                await file_manager.cleanup_file(save_path)
+
             finally:
                 await task_manager.remove_task(task_id)
 
@@ -87,82 +101,88 @@ class Workers:
         task_id: int,
         task_manager: TaskManager,
         config: Config,
+        logger: logging.Logger,
     ) -> None:
-        """Upload worker with video optimization and semaphore control"""
-        from .logging_config import setup_logging
-        from .utils import humanbytes
+        """
+        Upload file to Telegram with video optimization
 
-        log = setup_logging()
+        Args:
+            client: Telegram client
+            event: Triggering event
+            filename: File to upload
+            caption: Optional caption
+            task_id: Unique task identifier
+            task_manager: Task manager instance
+            config: Application config
+            logger: Logger instance
+        """
+        original_path = config.download_path / filename
+        file_manager = FileManager(logger)
+        ffmpeg = FFmpegHelper(logger)
 
-        original_file_path = config.download_path / filename
         thumb_path: Optional[Path] = None
         optimized_path: Optional[Path] = None
-        upload_path: Path = original_file_path
+        upload_path = original_path
+        optimized = False
 
-        # Flag untuk track apakah optimized file dibuat
-        optimization_successful = False
-
-        # Acquire semaphore sebelum mulai upload
-        async with task_manager.upload_semaphore:
+        async with task_manager.get_semaphore(TaskType.UPLOAD):
             try:
-                if not original_file_path.exists():
+                if not original_path.exists():
                     raise FileNotFoundError(f"File not found: {filename}")
 
-                log.info(
+                logger.info(
                     f"Task {task_id:3} | UPLOAD   | "
-                    f"File: {filename} | Caption: {caption or 'None'}"
+                    f"{filename} | Caption: {caption or 'None'}"
                 )
 
-                # Check if video and optimize
-                is_video_ext = (
-                    original_file_path.suffix.lower() in config.VIDEO_EXTENSIONS
-                )
-
-                if is_video_ext:
-                    is_video = await FFmpegHelper.check_if_video(original_file_path)
-
-                    if is_video:
-                        log.info(
-                            f"Task {task_id:3} | UPLOAD   | Optimizing video for streaming..."
-                        )
-                        optimized_path = await FFmpegHelper.optimize_for_streaming(
-                            original_file_path
+                # Video optimization
+                if original_path.suffix.lower() in config.VIDEO_EXTENSIONS:
+                    if await ffmpeg.check_if_video(original_path):
+                        logger.info(
+                            f"Task {task_id:3} | UPLOAD   | Optimizing video..."
                         )
 
-                        # Hanya gunakan optimized file jika berhasil dibuat
+                        optimized_path = await ffmpeg.optimize_for_streaming(
+                            original_path
+                        )
+
                         if optimized_path and optimized_path.exists():
                             upload_path = optimized_path
-                            optimization_successful = True
-                            log.info(
+                            optimized = True
+                            logger.info(
                                 f"Task {task_id:3} | UPLOAD   | Using optimized file"
                             )
                         else:
-                            log.warning(
-                                f"Task {task_id:3} | UPLOAD   | Optimization failed, using original file"
+                            logger.warning(
+                                f"Task {task_id:3} | UPLOAD   | "
+                                "Optimization failed, using original"
                             )
-                            upload_path = original_file_path
 
-                # Extract metadata from the file that will be uploaded
-                width, height, duration = await FFmpegHelper.get_video_metadata(
-                    upload_path
-                )
+                # Extract metadata
+                width, height, duration = await ffmpeg.get_video_metadata(upload_path)
 
                 if not all([width, height, duration]):
                     raise ValueError("Failed to extract video metadata")
 
-                # Generate thumbnail from the file that will be uploaded
-                thumb_path = await FFmpegHelper.generate_thumbnail(upload_path)
+                # Generate thumbnail
+                thumb_path = await ffmpeg.generate_thumbnail(
+                    upload_path, config.THUMBNAIL_TIME, config.THUMBNAIL_QUALITY
+                )
 
-                # Prepare video attributes
+                # Prepare attributes
                 attributes = [
                     DocumentAttributeVideo(
-                        duration=duration, w=width, h=height, supports_streaming=True
+                        duration=duration,
+                        w=width,
+                        h=height,
+                        supports_streaming=True,
                     )
                 ]
 
                 # Upload
-                log.info(
-                    f"Task {task_id:3} | UPLOAD   | Uploading to {config.GUDANG_CHAT_ID}..."
+                logger.info(
+                    f"Task {task_id:3} | UPLOAD   | "
+                    f"Uploading to {config.GUDANG_CHAT_ID}..."
                 )
 
                 await client.send_file(
@@ -172,11 +192,11 @@ class Workers:
                     thumb=str(thumb_path) if thumb_path else None,
                     attributes=attributes,
                     progress_callback=create_progress_callback(
-                        filename, "Uploading", config.PROGRESS_UPDATE_INTERVAL
+                        filename, "Uploading", config.PROGRESS_UPDATE_INTERVAL, logger
                     ),
                 )
 
-                log.info(f"Task {task_id:3} | UPLOAD   | Success: {filename}")
+                logger.info(f"Task {task_id:3} | UPLOAD   | Success: {filename}")
 
                 await event.respond(
                     f"✅ **Upload Complete** [`{task_id}`]\n"
@@ -184,25 +204,26 @@ class Workers:
                     f"📺 Resolution: `{width}x{height}`\n"
                     f"⏱️ Duration: `{duration}s`\n"
                     f"🎬 Streaming: `Enabled`\n"
-                    f"🔧 Optimized: `{'Yes' if optimization_successful else 'No'}`"
+                    f"🔧 Optimized: `{'Yes' if optimized else 'No'}`"
+                )
+
+            except FileNotFoundError as e:
+                logger.error(f"Task {task_id:3} | UPLOAD   | {e}")
+                await event.respond(
+                    f"❌ **File Not Found** [`{task_id}`]\n`{filename}`"
                 )
 
             except Exception as e:
-                log.exception(f"Task {task_id:3} | UPLOAD   | Error: {filename}")
+                logger.exception(f"Task {task_id:3} | UPLOAD   | Error: {filename}")
                 await event.respond(
                     f"❌ **Upload Failed** [`{task_id}`]\nError: `{str(e)[:200]}`"
                 )
+
             finally:
-                # Cleanup logic yang lebih jelas
-                # Cleanup thumbnail (always)
-                if thumb_path:
-                    await FileManager.cleanup_file(thumb_path)
-
-                # Cleanup optimized file (only if it was created and is different from original)
-                if optimized_path and optimized_path != original_file_path:
-                    await FileManager.cleanup_file(optimized_path)
-
-                # Cleanup original file (always, after upload complete or failed)
-                await FileManager.cleanup_file(original_file_path)
-
+                # Cleanup: thumbnail, optimized file, then original
+                await file_manager.cleanup_files(
+                    thumb_path,
+                    optimized_path if optimized_path != original_path else None,
+                    original_path,
+                )
                 await task_manager.remove_task(task_id)
